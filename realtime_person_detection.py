@@ -18,7 +18,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 import cv2  # type: ignore
 
@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to the log file where timestamp and count are written",
     )
     parser.add_argument(
+        "--dwell-log-file",
+        type=str,
+        default="people_dwell.txt",
+        help="Path to the log file where exit dwell times are written",
+    )
+    parser.add_argument(
         "--no-display",
         action="store_true",
         help="Disable display window (useful for headless environments)",
@@ -71,6 +77,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional capture height to request from camera",
+    )
+    parser.add_argument(
+        "--max-missed-seconds",
+        type=float,
+        default=0.5,
+        help="Time without detections before a person is considered exited",
     )
     return parser.parse_args()
 
@@ -219,6 +231,111 @@ def draw_green_rectangle(frame, xyxy: Tuple[int, int, int, int]) -> None:
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
 
+def draw_label(frame, text: str, xyxy: Tuple[int, int, int, int]) -> None:
+    x1, y1, x2, y2 = xyxy
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.5
+    thickness = 1
+    margin = 3
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+    x = max(0, x1)
+    y = max(th + 2 * margin, y1)
+    cv2.rectangle(frame, (x, y - th - 2 * margin), (x + tw + 2 * margin, y), (0, 255, 0), -1)
+    cv2.putText(frame, text, (x + margin, y - margin), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+
+def compute_iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+    return inter_area / union
+
+
+class Track:
+    def __init__(self, track_id: int, bbox: Tuple[int, int, int, int], now_ts: float) -> None:
+        self.id: int = track_id
+        self.bbox: Tuple[int, int, int, int] = bbox
+        self.first_seen_ts: float = now_ts
+        self.last_seen_ts: float = now_ts
+
+
+class SimpleTracker:
+    def __init__(self, iou_threshold: float = 0.3, max_missed_seconds: float = 0.5) -> None:
+        self.iou_threshold = iou_threshold
+        self.max_missed_seconds = max_missed_seconds
+        self.next_id: int = 1
+        self.tracks: Dict[int, Track] = {}
+
+    def update(self, detections_xyxy: List[Tuple[int, int, int, int]], now_ts: float):
+        visible_tracks: List[Track] = []
+        exited_tracks: List[Track] = []
+
+        # Greedy IoU matching between existing tracks and detections
+        unmatched_tracks = set(self.tracks.keys())
+        unmatched_detections = set(range(len(detections_xyxy)))
+
+        # Build all IoUs
+        ious: List[Tuple[float, int, int]] = []
+        for tid, track in self.tracks.items():
+            for di in range(len(detections_xyxy)):
+                iou = compute_iou(track.bbox, detections_xyxy[di])
+                if iou >= self.iou_threshold:
+                    ious.append((iou, tid, di))
+        # Sort descending by IoU
+        ious.sort(key=lambda t: t[0], reverse=True)
+
+        assigned_tracks: Dict[int, int] = {}
+        assigned_dets: Dict[int, int] = {}
+        for iou, tid, di in ious:
+            if tid in assigned_tracks or di in assigned_dets:
+                continue
+            # Assign this detection to this track
+            assigned_tracks[tid] = di
+            assigned_dets[di] = tid
+            unmatched_tracks.discard(tid)
+            unmatched_detections.discard(di)
+
+        # Update matched tracks
+        for tid, di in assigned_tracks.items():
+            track = self.tracks[tid]
+            track.bbox = detections_xyxy[di]
+            track.last_seen_ts = now_ts
+            visible_tracks.append(track)
+
+        # Create new tracks for unmatched detections
+        for di in unmatched_detections:
+            bbox = detections_xyxy[di]
+            track = Track(self.next_id, bbox, now_ts)
+            self.tracks[track.id] = track
+            self.next_id += 1
+            visible_tracks.append(track)
+
+        # Determine exited tracks based on last seen timestamp
+        to_delete: List[int] = []
+        for tid in unmatched_tracks:
+            track = self.tracks[tid]
+            if (now_ts - track.last_seen_ts) > self.max_missed_seconds:
+                exited_tracks.append(track)
+                to_delete.append(tid)
+        for tid in to_delete:
+            del self.tracks[tid]
+
+        return visible_tracks, exited_tracks
+
+
 def format_timestamp_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -253,11 +370,14 @@ def main() -> int:
 
     # Prepare logging (append mode)
     log_path = args.log_file
-    os.makedirs(os.path.dirname(log_path), exist_ok=True) if os.path.dirname(log_path) else None
+    dwell_log_path = args.dwell_log_file
+    for p in (log_path, dwell_log_path):
+        os.makedirs(os.path.dirname(p), exist_ok=True) if os.path.dirname(p) else None
     try:
         log_file = open(log_path, mode="a", encoding="utf-8")
+        dwell_file = open(dwell_log_path, mode="a", encoding="utf-8")
     except Exception as ex:
-        print(f"[ERROR] Failed to open log file '{log_path}': {ex}", file=sys.stderr)
+        print(f"[ERROR] Failed to open log files: {ex}", file=sys.stderr)
         cap.release()
         return 3
 
@@ -266,6 +386,7 @@ def main() -> int:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     try:
+        tracker = SimpleTracker(iou_threshold=0.3, max_missed_seconds=float(args.max_missed_seconds))
         # Prepare OpenCV DNN if Ultralytics is not available
         net = None
         input_size: Tuple[int, int] = (640, 640)
@@ -307,7 +428,8 @@ def main() -> int:
                     print(f"[ERROR] Inference failed: {ex}", file=sys.stderr)
                     break
 
-                # Iterate over results (usually a single result for one frame)
+                # Collect person detections
+                dets: List[Tuple[int, int, int, int]] = []
                 for result in results:
                     boxes = getattr(result, "boxes", None)
                     if boxes is None:
@@ -318,12 +440,28 @@ def main() -> int:
                             conf = float(boxes.conf[i].item())  # type: ignore[attr-defined]
                             if cls_id != 0 or conf < args.confidence:
                                 continue
-                            xyxy_tensor = boxes.xyxy[i]  # type: ignore[attr-defined]
-                            x1, y1, x2, y2 = [int(v) for v in xyxy_tensor.tolist()]
-                            person_count += 1
-                            draw_green_rectangle(frame, (x1, y1, x2, y2))
+                            x1, y1, x2, y2 = [int(v) for v in boxes.xyxy[i].tolist()]  # type: ignore[attr-defined]
+                            dets.append((x1, y1, x2, y2))
                         except Exception:
                             continue
+
+                now_ts = time.time()
+                visible_tracks, exited_tracks = tracker.update(dets, now_ts)
+
+                for tr in visible_tracks:
+                    draw_green_rectangle(frame, tr.bbox)
+                    draw_label(frame, f"ID {tr.id}", tr.bbox)
+                person_count = len(visible_tracks)
+
+                # Log dwell times for exited tracks
+                for tr in exited_tracks:
+                    dwell_seconds = tr.last_seen_ts - tr.first_seen_ts
+                    timestamp_iso = format_timestamp_utc()
+                    try:
+                        dwell_file.write(f"{timestamp_iso},id={tr.id},dwell_seconds={dwell_seconds:.3f}\n")
+                        dwell_file.flush()
+                    except Exception:
+                        pass
             else:
                 # OpenCV DNN path (ONNX)
                 try:
@@ -337,9 +475,22 @@ def main() -> int:
                     print(f"[ERROR] DNN inference failed: {ex}", file=sys.stderr)
                     break
 
-                for (x1, y1, x2, y2) in boxes_xyxy:
-                    draw_green_rectangle(frame, (x1, y1, x2, y2))
-                person_count = len(boxes_xyxy)
+                now_ts = time.time()
+                visible_tracks, exited_tracks = tracker.update(boxes_xyxy, now_ts)
+
+                for tr in visible_tracks:
+                    draw_green_rectangle(frame, tr.bbox)
+                    draw_label(frame, f"ID {tr.id}", tr.bbox)
+                person_count = len(visible_tracks)
+
+                for tr in exited_tracks:
+                    dwell_seconds = tr.last_seen_ts - tr.first_seen_ts
+                    timestamp_iso = format_timestamp_utc()
+                    try:
+                        dwell_file.write(f"{timestamp_iso},id={tr.id},dwell_seconds={dwell_seconds:.3f}\n")
+                        dwell_file.flush()
+                    except Exception:
+                        pass
 
             # Log timestamp and person count
             timestamp_iso = format_timestamp_utc()
@@ -372,6 +523,10 @@ def main() -> int:
     finally:
         try:
             log_file.close()
+        except Exception:
+            pass
+        try:
+            dwell_file.close()
         except Exception:
             pass
         cap.release()
